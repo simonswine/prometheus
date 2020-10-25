@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,8 +34,11 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 )
@@ -560,6 +564,97 @@ func analyzeBlock(path, blockID string, limit int) error {
 	}
 	fmt.Printf("\nHighest cardinality metric names:\n")
 	printInfo(postingInfos)
+	return nil
+}
+
+func loadSamples(path string) error {
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+
+	head, err := tsdb.NewHead(
+		nil,
+		logger,
+		nil,
+		time.Duration(time.Hour*24*365).Milliseconds(), // a year should be enough
+		path,
+		nil,
+		tsdb.DefaultStripeSize,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	if err := head.Init(math.MinInt64); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		space2 := strings.LastIndex(line, " ")
+		space1 := strings.LastIndex(line[:space2], " ")
+
+		labelsStr := line[:space1]
+		valueStr := line[space1+1 : space2]
+		tsStr := line[space2+1:]
+
+		labels, err := parser.ParseMetric(labelsStr)
+		if err != nil {
+			return fmt.Errorf("unable to parse labels '%s' on line %d: %w", labelsStr, lineNo, err)
+		}
+
+		value, err := strconv.ParseFloat(valueStr, 64)
+		if err != nil {
+			return fmt.Errorf("unable to parse value '%s' on line %d: %w", valueStr, lineNo, err)
+		}
+
+		ts, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to parse timestamp '%s' on line %d: %w", tsStr, lineNo, err)
+		}
+
+		a := head.Appender(ctx)
+		if _, err := a.Add(labels, ts, value); err != nil {
+			return err
+		}
+		if err := a.Commit(); err != nil {
+			return err
+		}
+
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	seriesCount := head.NumSeries()
+	mint := head.MinTime()
+	maxt := head.MaxTime() + 1
+
+	logger.Log("msg", "flushing block", "series_count", seriesCount, "mint", timestamp.Time(mint), "maxt", timestamp.Time(maxt))
+
+	// Flush head to disk as a block.
+	compactor, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		logger,
+		[]int64{int64(1000 * (2 * time.Hour).Seconds())}, // Does not matter, used only for planning.
+		chunkenc.NewPool())
+	if err != nil {
+		return err
+	}
+	if _, err := compactor.Write(path, head, mint, maxt, nil); err != nil {
+		return fmt.Errorf("compactor write: %w", err)
+	}
+
+	if err := head.Close(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
